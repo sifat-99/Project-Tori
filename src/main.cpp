@@ -1,18 +1,18 @@
 #include <Adafruit_NeoPixel.h>
 #include <Arduino.h>
 #include <AsyncTCP.h>
+#include <BasicLinearAlgebra.h>
 #include <DallasTemperature.h>
 #include <ESP32Servo.h>
 #include <ESPAsyncWebServer.h>
+#include <HTTPClient.h>
+#include <MPU9250.h>
 #include <OneWire.h>
-#include <WiFi.h>
 #include <TinyGPSPlus.h>
+#include <WiFi.h>
 #include <Wire.h>
-#include <MPU9250.h> // Ensure you install "MPU9250 by Hideakitai" from the Library Manager
 
-// --- Configuration ---
-const char *ssid = "tori";
-const char *password = "12345678";
+using namespace BLA;
 
 // --- Hardware Pins ---
 const int enablePin = 4;
@@ -20,12 +20,12 @@ const int dirPin1 = 6;
 const int dirPin2 = 5;
 const int frontServoPin = 7;
 const int backServoPin = 8;
-const int rgbPin = 46; // CHANGED FROM 48 TO AVOID SDA CONFLICT
+const int rgbPin = 48;
 const int tempPin = 11;
 const int gpsRxPin = 38;
 const int gpsTxPin = 40;
-const int sdaPin = 48; // NEW: MPU9250 SDA
-const int sclPin = 47; // NEW: MPU9250 SCL
+const int sdaPin = 9;
+const int sclPin = 47;
 
 // --- PWM Constants ---
 const int pwmFreq = 5000;
@@ -41,442 +41,551 @@ OneWire oneWire(tempPin);
 DallasTemperature tempSensor(&oneWire);
 HardwareSerial GPS_Serial(1);
 TinyGPSPlus gps;
-MPU9250 mpu; // NEW: MPU9250 Object
+MPU9250 mpu;
 
 // --- Global States & Thread Safety Flags ---
+void TaskCore0(void *pvParameters); // Forward declaration for FreeRTOS task
+TaskHandle_t TaskCore0Handle;
 int currentSpeed = 0;
 int targetServoAngle = 97;
+int targetBackServoAngle = 97;
 bool isStopped = true;
 bool hardwareUpdateRequired = false;
 bool servoUpdateRequired = false;
+bool backServoUpdateRequired = false;
+bool serverIsRunning = false;
 
-// Global variable to store the latest sensors
+// 0 = Normal, 1 = Calibrating Accel/Gyro, 2 = Calibrating Mag
+int calibrationState = 0;
+
+// --- WiFi Default Credentials ---
+const char *defaultSSID = "IoT Lab";
+const char *defaultPass = "bubt1234";
+
+// --- Sensor Global Variables ---
 float currentTemp = 0.0;
 float currentLat = 0.0;
 float currentLng = 0.0;
-float mpuPitch = 0.0; // NEW: Store Pitch
-float mpuRoll = 0.0;  // NEW: Store Roll
-float mpuYaw = 0.0;   // NEW: Store Yaw
+float mpuPitch = 0.0;
+float mpuRoll = 0.0;
+float mpuYaw = 0.0;
 
-unsigned long previousRGBTime = 0;
-const long rgbInterval = 5;
-uint16_t rainbowHue = 0;
+// --- ZUPT Extended Kalman Filter (EKF) State Matrices ---
+// X-Axis
+BLA::Matrix<2, 1> stateX = {0.0, 0.0}; // [posX, velX]^T
+BLA::Matrix<2, 2> PX = {1.0, 0.0, 0.0, 1.0};
+
+// Y-Axis
+BLA::Matrix<2, 1> stateY = {0.0, 0.0}; // [posY, velY]^T
+BLA::Matrix<2, 2> PY = {1.0, 0.0, 0.0, 1.0};
+
+// Z-Axis
+BLA::Matrix<2, 1> stateZ = {0.0, 0.0}; // [posZ, velZ]^T
+BLA::Matrix<2, 2> PZ = {1.0, 0.0, 0.0, 1.0};
+
+// Covariance Constants
+BLA::Matrix<2, 2> Q = {0.001, 0.0, 0.0, 0.001}; // Process Noise
+BLA::Matrix<1, 1> R = {0.01};                   // Measurement Noise
+BLA::Matrix<1, 2> H = {0.0, 1.0};               // Measurement Matrix (We measure Velocity = 0)
+BLA::Matrix<1, 1> Z_meas = {0.0};               // ZUPT Measurement (Velocity is zero)
+
+// --- Navigation & Dead Reckoning Variables ---
+float velX = 0.0, velY = 0.0, velZ = 0.0;
+float posX = 0.0, posY = 0.0, posZ = 0.0;
+unsigned long lastIntegrationTime = 0;
+
+// --- Filter Settling / Warm-up Variable ---
+unsigned long systemStartTime = 0;
 
 unsigned long previousTempTime = 0;
 const long tempInterval = 2000;
 
 unsigned long previousMPUTime = 0;
-const long mpuInterval = 100; // Update IMU every 100ms internally
+const long mpuInterval = 10;
 
-// --- Logic Functions (Called only from Loop for thread safety) ---
-void applyMotorLogic()
-{
-    ledcWrite(pwmChannel, 255 - currentSpeed);
+unsigned long previousSerialTime = 0;
+const long serialInterval = 100;
 
-    // if (isStopped || currentSpeed == 0)
-    // {
-    //     LED_RGB.setPixelColor(0, LED_RGB.Color(255, 0, 0)); // Red
-    // }
-    // else if (currentSpeed < 255)
-    // {
-    //     LED_RGB.setPixelColor(0, LED_RGB.Color(0, 255, 0)); // Green
-    // }
-    // LED_RGB.show();
+// --- Logic Functions ---
+void applyMotorLogic() {
+  if (isStopped) {
+    ledcWrite(pwmChannel, 0);
+  } else {
+    ledcWrite(pwmChannel, currentSpeed);
+  }
 }
 
-void emergencyStop()
-{
-    isStopped = true;
-    currentSpeed = 0;
-    targetServoAngle = 97;
-    digitalWrite(dirPin1, LOW);
-    digitalWrite(dirPin2, LOW);
-    frontServo.write(97);
-    backServo.write(97);
-    applyMotorLogic();
-    Serial.println("EVENT:HALTED");
+void emergencyStop() {
+  isStopped = true;
+  currentSpeed = 0;
+  targetServoAngle = 97;
+  digitalWrite(dirPin1, LOW);
+  digitalWrite(dirPin2, LOW);
+  frontServo.write(97);
+  backServo.write(97);
+  applyMotorLogic();
+  Serial.println("EVENT:HALTED");
 }
 
-void handleTemperature()
-{
-    if (millis() - previousTempTime >= tempInterval)
-    {
-        previousTempTime = millis();
-        tempSensor.requestTemperatures();
-        float tempC = tempSensor.getTempCByIndex(0);
-
-        if (tempC != DEVICE_DISCONNECTED_C)
-        {
-            currentTemp = tempC;
-            Serial.print("TEMP OF THE MAIN BOARD: ");
-            Serial.print(currentTemp);
-            Serial.println(" °C");
-        }
-        else
-        {
-            Serial.println("TEMP: SENSOR ERROR (Check Wiring)");
-        }
+void handleTemperature() {
+  if (millis() - previousTempTime >= tempInterval) {
+    previousTempTime = millis();
+    tempSensor.requestTemperatures();
+    float tempC = tempSensor.getTempCByIndex(0);
+    if (tempC != DEVICE_DISCONNECTED_C) {
+      currentTemp = tempC;
     }
+  }
 }
 
-void handleGPS()
-{
-    while (GPS_Serial.available() > 0)
-    {
-        gps.encode(GPS_Serial.read());
+void handleGPS() {
+  while (GPS_Serial.available() > 0) {
+    gps.encode(GPS_Serial.read());
+  }
+  static unsigned long lastGpsTime = 0;
+  if (millis() - lastGpsTime >= 2000) {
+    lastGpsTime = millis();
+    if (gps.location.isValid()) {
+      currentLat = gps.location.lat();
+      currentLng = gps.location.lng();
     }
-
-    static unsigned long lastGpsTime = 0;
-    if (millis() - lastGpsTime >= 2000)
-    {
-        lastGpsTime = millis();
-
-        if (gps.charsProcessed() < 10)
-        {
-            Serial.println("GPS: WIRING_ERROR");
-        }
-        else
-        {
-            Serial.print("GPS_SAT: ");
-            Serial.println(gps.satellites.value());
-
-            if (gps.location.isValid())
-            {
-                currentLat = gps.location.lat();
-                currentLng = gps.location.lng();
-
-                Serial.print("GPS: ");
-                Serial.print(currentLat, 6);
-                Serial.print(",");
-                Serial.println(currentLng, 6);
-            }
-        }
-    }
+  }
 }
 
-// NEW: Function to handle MPU9250 updating
-void handleMPU()
-{
-    if (millis() - previousMPUTime >= mpuInterval)
-    {
-        previousMPUTime = millis();
-        if (mpu.update())
-        {
-            // Get accelerometer values
-            float accelX = mpu.getAccX();
-            float accelY = mpu.getAccY();
-            float accelZ = mpu.getAccZ();
+// ==========================================
+// ADVANCED DEAD RECKONING (NHC & ZUPT)
+// ==========================================
+void handleMPU() {
+  if (calibrationState != 0)
+    return; // Do not run IMU logic during calibration
 
-            // Calculate Pitch and Roll from accelerometer (in degrees)
-            mpuPitch = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * 180.0 / M_PI;
-            mpuRoll = atan2(accelY, accelZ) * 180.0 / M_PI;
+  if (millis() - previousMPUTime >= mpuInterval) {
+    previousMPUTime = millis();
 
-            // Get Yaw from gyroscope
-            mpuYaw = mpu.getYaw();
+    if (mpu.update()) {
+      mpuPitch = mpu.getPitch();
+      mpuRoll = mpu.getRoll();
+      mpuYaw = mpu.getYaw();
 
-            Serial.print("MPU9250 - Pitch: ");
-            Serial.print(mpuPitch, 2);
-            Serial.print("° | Roll: ");
-            Serial.print(mpuRoll, 2);
-            Serial.print("° | Yaw: ");
-            Serial.print(mpuYaw, 2);
-            Serial.print("° | Accel(g): ");
-            Serial.print(accelX, 2);
-            Serial.print(",");
-            Serial.print(accelY, 2);
-            Serial.print(",");
-            Serial.print(accelZ, 2);
-            Serial.println();
-        }
-        else
-        {
-            Serial.println("MPU9250: Update Failed");
-        }
+      unsigned long currentTime = micros();
+      float dt = (currentTime - lastIntegrationTime) / 1000000.0;
+      lastIntegrationTime = currentTime;
+
+      if (millis() - systemStartTime < 3000) {
+        posX = 0;
+        posY = 0;
+        posZ = 0;
+        velX = 0;
+        velY = 0;
+        velZ = 0;
+        return;
+      }
+      if (dt > 0.1)
+        return;
+
+      // Get Raw Linear Acceleration
+      float rawAccX = mpu.getLinearAccX();
+      float rawAccY = mpu.getLinearAccY();
+      float rawAccZ = mpu.getLinearAccZ();
+
+      float yaw_rad = mpuYaw * M_PI / 180.0;
+
+      // Transform Body Acceleration to Earth Acceleration using Yaw
+      float acc_earth_x = rawAccX * cos(yaw_rad) - rawAccY * sin(yaw_rad);
+      float acc_earth_y = rawAccX * sin(yaw_rad) + rawAccY * cos(yaw_rad);
+      float acc_earth_z = rawAccZ;
+
+      // State Transition Matrix (F) and Control Matrix (B)
+      BLA::Matrix<2, 2> F = {1.0, (float)dt, 0.0, 1.0};
+      BLA::Matrix<2, 1> B = {0.5f * (float)dt * (float)dt, (float)dt};
+
+      float DEADBAND = 0.12;
+      BLA::Matrix<2, 2> I2 = {1.0, 0.0, 0.0, 1.0}; // 2x2 Identity Matrix
+
+      // ----------------------------------------------------
+      // X-Axis EKF (Earth Frame)
+      // ----------------------------------------------------
+      BLA::Matrix<1, 1> uX = {acc_earth_x * 9.81f};
+      stateX = F * stateX + B * uX; // Prediction
+      PX = F * PX * ~F + Q;
+
+      if (abs(rawAccX) < DEADBAND) { // ZUPT Update (Zero Velocity Update)
+        BLA::Matrix<1, 1> Y = Z_meas - H * stateX; // Innovation
+        BLA::Matrix<1, 1> S = H * PX * ~H + R;     // Innovation Covariance
+        BLA::Matrix<2, 1> K = PX * ~H * Inverse(S);// Kalman Gain
+
+        stateX = stateX + K * Y;                   // State Update
+        PX = (I2 - K * H) * PX;                    // Covariance Update
+
+        stateX(1, 0) *= 0.85; // Additional hydrodynamic friction
+      } else {
+        stateX(1, 0) *= 0.98; // Continuous friction
+      }
+
+      // ----------------------------------------------------
+      // Y-Axis EKF (Earth Frame)
+      // ----------------------------------------------------
+      BLA::Matrix<1, 1> uY = {acc_earth_y * 9.81f};
+      stateY = F * stateY + B * uY;
+      PY = F * PY * ~F + Q;
+
+      if (abs(rawAccY) < DEADBAND) {
+        BLA::Matrix<1, 1> Y = Z_meas - H * stateY;
+        BLA::Matrix<1, 1> S = H * PY * ~H + R;
+        BLA::Matrix<2, 1> K = PY * ~H * Inverse(S);
+
+        stateY = stateY + K * Y;
+        PY = (I2 - K * H) * PY;
+
+        stateY(1, 0) *= 0.85;
+      } else {
+        stateY(1, 0) *= 0.98;
+      }
+
+      // ----------------------------------------------------
+      // Z-Axis EKF
+      // ----------------------------------------------------
+      BLA::Matrix<1, 1> uZ = {acc_earth_z * 9.81f};
+      stateZ = F * stateZ + B * uZ;
+      PZ = F * PZ * ~F + Q;
+
+      if (abs(rawAccZ) < DEADBAND) {
+        BLA::Matrix<1, 1> Y = Z_meas - H * stateZ;
+        BLA::Matrix<1, 1> S = H * PZ * ~H + R;
+        BLA::Matrix<2, 1> K = PZ * ~H * Inverse(S);
+
+        stateZ = stateZ + K * Y;
+        PZ = (I2 - K * H) * PZ;
+
+        stateZ(1, 0) *= 0.85;
+      } else {
+        stateZ(1, 0) *= 0.98;
+      }
+
+      // ----------------------------------------------------
+      // Update global vars for telemetry
+      // ----------------------------------------------------
+      posX = stateX(0, 0);
+      posY = stateY(0, 0);
+      posZ = stateZ(0, 0);
+      velX = stateX(1, 0);
+      velY = stateY(1, 0);
+      velZ = stateZ(1, 0);
     }
+  }
 }
 
-// --- HTML UI ---
+void connectToWiFi(String reqSSID, String reqPass) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.disconnect();
+    delay(500);
+  }
+  Serial.println("STATUS:Attempting to connect to " + reqSSID);
+
+  WiFi.begin(reqSSID.c_str(), reqPass.c_str());
+
+  int wifiWait = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiWait < 20) {
+    delay(500);
+    wifiWait++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("STATUS:Connected! IP: " + WiFi.localIP().toString());
+    if (!serverIsRunning) {
+      server.begin();
+      serverIsRunning = true;
+    }
+  } else {
+    Serial.println("STATUS:WiFi Failed!");
+    WiFi.disconnect();
+  }
+}
+
+// --- Helper to Send Telemetry immediately to App so Modal pops up ---
+void sendTelemetry() {
+  String json = "{";
+  json += "\"pitch\":" + String(mpuPitch, 2) + ",";
+  json += "\"roll\":" + String(mpuRoll, 2) + ",";
+  json += "\"yaw\":" + String(mpuYaw, 2) + ",";
+  json += "\"posX\":" + String(posX, 4) + ",";
+  json += "\"posY\":" + String(posY, 4) + ",";
+  json += "\"posZ\":" + String(posZ, 4) + ",";
+  json += "\"velX\":" + String(velX, 4) + ",";
+  json += "\"lat\":" + String(currentLat, 6) + ",";
+  json += "\"lng\":" + String(currentLng, 6) + ",";
+  json += "\"temp\":" + String(currentTemp, 2) + ",";
+  json += "\"cal\":" + String(calibrationState); // Added Calibration State
+  json += "}";
+
+  Serial.println("DATA:" + json); // Send via USB immediately
+}
+
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
-<head>
-  <meta charset="UTF-8">
-  <title>Project Tori 🛶</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root { --bg: #0f172a; --glass: rgba(30, 41, 59, 0.7); --accent: #00d2ff; --danger: #ef4444; }
-    body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: white; display: flex; justify-content: center; padding: 20px; }
-    .container { width: 100%; max-width: 400px; background: var(--glass); padding: 30px; border-radius: 24px; text-align: center; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
-    .btn { width: 48%; padding: 15px; margin: 5px 0; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; transition: 0.2s; }
-    .stop-btn { width: 100%; background: var(--danger); color: white; margin-top: 20px; padding: 20px; font-size: 1.2rem; border-radius: 12px; font-weight: 800; border: none; cursor: pointer; }
-    input[type=range] { width: 100%; margin: 20px 0; accent-color: var(--accent); }
-    .label { display: flex; justify-content: space-between; font-weight: bold; margin-top: 10px;}
-    .hint { font-size: 0.9rem; color: #00d2ff; margin-top: 20px; background: rgba(0,210,255,0.1); padding: 10px; border-radius: 8px; }
-    .telemetry { background: rgba(0,0,0,0.3); padding: 15px; border-radius: 12px; margin-bottom: 20px; font-size: 0.9rem; display: flex; justify-content: space-around;}
-    .telemetry span { color: var(--accent); font-weight: bold; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>TORI COMMAND 🛶</h1>
-
-    <div class="telemetry">
-      <div>Pitch: <br><span id="uiPitch">0.0&deg;</span></div>
-      <div>Roll: <br><span id="uiRoll">0.0&deg;</span></div>
-      <div>Yaw: <br><span id="uiYaw">0.0&deg;</span></div>
-    </div>
-
-    <div style="display:flex; justify-content: space-between;">
-        <button class="btn" style="background:#3a7bd5; color:white;" onclick="sendAction('forward')">FORWARD</button>
-        <button class="btn" style="background:#f59e0b; color:white;" onclick="sendAction('reverse')">REVERSE</button>
-    </div>
-    <div class="label"><span>Thruster Power</span><span id="sv">0</span></div>
-    <input type="range" id="speedIdx" min="0" max="255" value="0" oninput="updateSpeed(this.value)">
-    <div class="label"><span>Fin Steering</span><span id="fv">97</span></div>
-    <input type="range" id="frontIdx" min="40" max="150" value="97" oninput="updateServo('front', this.value)">
-    <button class="stop-btn" onclick="sendAction('stopped')">EMERGENCY STOP</button>
-    <div class="hint" id="keyHint">Use &uarr; &darr; &larr; &rarr; and Spacebar</div>
-  </div>
-  <script>
-    function sendAction(dir) {
-        fetch('/action?dir=' + dir);
-        if(dir === 'stopped') {
-            document.getElementById('speedIdx').value = 0; document.getElementById('sv').innerText = 0;
-            document.getElementById('frontIdx').value = 97; document.getElementById('fv').innerText = 97;
-        }
-    }
-    function updateSpeed(val) { document.getElementById('sv').innerText = val; fetch('/speed?val=' + val); }
-    function updateServo(target, val) { document.getElementById('fv').innerText = val; fetch('/servo?target=' + target + '&val=' + val); }
-
-    window.addEventListener('keydown', function(e) {
-      let sInput = document.getElementById('speedIdx');
-      let fInput = document.getElementById('frontIdx');
-      switch(e.key) {
-        case 'ArrowUp': sendAction('forward'); let sUp = Math.min(parseInt(sInput.value) + 25, 255); updateSpeed(sUp); sInput.value = sUp; break;
-        case 'ArrowDown': sendAction('reverse'); let sDown = Math.min(parseInt(sInput.value) + 25, 255); updateSpeed(sDown); sInput.value = sDown; break;
-        case 'ArrowLeft': let a = Math.max(parseInt(fInput.value) - 15, 40); updateServo('front', a); fInput.value = a; break;
-        case 'ArrowRight': let d = Math.min(parseInt(fInput.value) + 15, 150); updateServo('front', d); fInput.value = d; break;
-        case ' ': sendAction('stopped'); break;
-      }
-    });
-
-    // NEW: Fetch IMU data periodically
-    setInterval(() => {
-      fetch('/imu')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('uiPitch').innerHTML = data.pitch.toFixed(1) + '&deg;';
-          document.getElementById('uiRoll').innerHTML = data.roll.toFixed(1) + '&deg;';
-          document.getElementById('uiYaw').innerHTML = data.yaw.toFixed(1) + '&deg;';
-        })
-        .catch(err => console.log('IMU fetch error', err));
-    }, 1000); // Updates every 1 second
-  </script>
-</body>
+<head><title>Tori Web</title></head>
+<body><h1>Web Server Active</h1></body>
 </html>
 )rawliteral";
 
-void setup()
-{
-    Serial.begin(115200);
-    GPS_Serial.begin(9600, SERIAL_8N1, gpsRxPin, gpsTxPin);
-
-    // NEW: Setup Custom I2C Pins and initialize MPU9250
-    Wire.begin(sdaPin, sclPin);
-    Wire.setClock(400000); // Set I2C clock to 400kHz
-    delay(2000);
-    if (!mpu.setup(0x68))
-    { // Default I2C address for MPU9250 is usually 0x68
-        Serial.println("MPU9250 Connection Failed! Check Wiring.");
-    }
-    else
-    {
-        Serial.println("MPU9250 Connected Successfully.");
-        delay(500);
-
-        // Calibrate accelerometer and gyroscope
-        Serial.println("Calibrating MPU9250... Keep it still!");
-        mpu.calibrateAccelGyro();
-        delay(500);
-
-        // Calibrate magnetometer
-        Serial.println("Calibrating Magnetometer... Rotate slowly!");
-        mpu.calibrateMag();
-        delay(500);
-
-        Serial.println("MPU9250 Calibration Complete!");
-    }
-
-    // LED_RGB.begin();
-    // LED_RGB.setBrightness(50);
-
-    tempSensor.begin();
-
-    ledcSetup(pwmChannel, pwmFreq, pwmResolution);
-    ledcAttachPin(enablePin, pwmChannel);
-    pinMode(dirPin1, OUTPUT);
-    pinMode(dirPin2, OUTPUT);
-
-    ESP32PWM::allocateTimer(0);
-    ESP32PWM::allocateTimer(1);
-    frontServo.attach(frontServoPin, 500, 2400);
-    backServo.attach(backServoPin, 500, 2500);
-
-    emergencyStop();
-
-    WiFi.begin(ssid, password);
-
-    int wifiWait = 0;
-    while (WiFi.status() != WL_CONNECTED && wifiWait < 10)
-    {
-        delay(500);
-        Serial.print(".");
-        wifiWait++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        Serial.println("\nWiFi Ready! IP: " + WiFi.localIP().toString());
-    }
-    else
-    {
-        Serial.println("\nWiFi Failed! Proceeding with USB only.");
-    }
-
-    // --- Web Handlers ---
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-              { request->send(200, "text/html", index_html); });
-
-    server.on("/temp", HTTP_GET, [](AsyncWebServerRequest *request)
-              {
-    String tempString = String(currentTemp);
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", tempString);
-    response->addHeader("Access-Control-Allow-Origin", "*");
-    request->send(response); });
-
-    // NEW: Web Handler for IMU Data returning JSON format
-    server.on("/imu", HTTP_GET, [](AsyncWebServerRequest *request)
-              {
-    String jsonResponse = "{\"pitch\":" + String(mpuPitch) +
-                          ", \"roll\":" + String(mpuRoll) +
-                          ", \"yaw\":" + String(mpuYaw) + "}";
-    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", jsonResponse);
-    response->addHeader("Access-Control-Allow-Origin", "*");
-    request->send(response); });
-
-    server.on("/speed", HTTP_GET, [](AsyncWebServerRequest *request)
-              {
-    if (request->hasParam("val")) {
-      currentSpeed = request->getParam("val")->value().toInt();
-      hardwareUpdateRequired = true;
-    }
-    request->send(200); });
-
-    server.on("/servo", HTTP_GET, [](AsyncWebServerRequest *request)
-              {
-    if (request->hasParam("target") && request->hasParam("val")) {
-      int angle = request->getParam("val")->value().toInt();
-      String target = request->getParam("target")->value();
-
-      if (target == "front") {
-        frontServo.write(angle);
-      } else if (target == "back") {
-        backServo.write(angle);
+void fetchIPLocation() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("STATUS: Fetching Location via IP API...");
+    HTTPClient http;
+    http.begin("http://ip-api.com/csv/?fields=lat,lon");
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      int commaIndex = payload.indexOf(',');
+      if (commaIndex != -1) {
+        currentLat = payload.substring(0, commaIndex).toFloat();
+        currentLng = payload.substring(commaIndex + 1).toFloat();
+        Serial.println(
+            "STATUS: IP Location Updated! Lat: " + String(currentLat, 6) +
+            " Lng: " + String(currentLng, 6));
       }
+    } else {
+      Serial.println("ERROR: IP API Failed (Code: " + String(httpCode) + ")");
     }
-    AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "OK");
-    response->addHeader("Access-Control-Allow-Origin", "*");
-    request->send(response); });
-
-    server.on("/action", HTTP_GET, [](AsyncWebServerRequest *request)
-              {
-    if (request->hasParam("dir")) {
-      String dir = request->getParam("dir")->value();
-      if (dir == "forward") {
-        digitalWrite(dirPin1, HIGH);
-        digitalWrite(dirPin2, LOW);
-        isStopped = false;
-      } else if (dir == "reverse") {
-        digitalWrite(dirPin1, LOW);
-        digitalWrite(dirPin2, HIGH);
-        isStopped = false;
-      } else {
-        isStopped = true;
-        currentSpeed = 0;
-      }
-      hardwareUpdateRequired = true;
-    }
-    request->send(200); });
-
-    server.begin();
+    http.end();
+  }
 }
 
-void loop()
-{
-    if (hardwareUpdateRequired)
-    {
-        applyMotorLogic();
-        hardwareUpdateRequired = false;
-    }
+void setup() {
+  Serial.begin(115200);
+  GPS_Serial.begin(9600, SERIAL_8N1, gpsRxPin, gpsTxPin);
 
-    if (servoUpdateRequired)
-    {
-        frontServo.write(targetServoAngle);
-        servoUpdateRequired = false;
-    }
+  Wire.begin(sdaPin, sclPin);
+  Wire.setClock(400000);
+  delay(2000);
 
+  tempSensor.begin();
+
+  ledcSetup(pwmChannel, pwmFreq, pwmResolution);
+  ledcAttachPin(enablePin, pwmChannel);
+  pinMode(dirPin1, OUTPUT);
+  pinMode(dirPin2, OUTPUT);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  frontServo.attach(frontServoPin, 500, 2400);
+  backServo.attach(backServoPin, 500, 2500);
+
+  emergencyStop();
+
+  // 1. CONNECT TO WIFI FIRST
+  WiFi.mode(WIFI_STA);
+  Serial.println("STATUS: Attempting to connect to default WiFi...");
+  WiFi.begin(defaultSSID, defaultPass);
+
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 5000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("STATUS: WiFi Connected! IP: " + WiFi.localIP().toString());
+    server.begin();
+    serverIsRunning = true;
+    fetchIPLocation();
+  } else {
+    Serial.println("STATUS: WiFi Failed! Running in USB-only mode.");
+  }
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", index_html);
+  });
+
+  server.on("/imu", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"pitch\":" + String(mpuPitch, 2) + ",";
+    json += "\"roll\":" + String(mpuRoll, 2) + ",";
+    json += "\"yaw\":" + String(mpuYaw, 2) + ",";
+    json += "\"posX\":" + String(posX, 4) + ",";
+    json += "\"posY\":" + String(posY, 4) + ",";
+    json += "\"posZ\":" + String(posZ, 4) + ",";
+    json += "\"velX\":" + String(velX, 4) + ",";
+    json += "\"lat\":" + String(currentLat, 6) + ",";
+    json += "\"lng\":" + String(currentLng, 6) + ",";
+    json += "\"temp\":" + String(currentTemp, 2) + ",";
+    json += "\"cal\":" + String(calibrationState); // Send Cal State via Web
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  Serial.println("Ready for commands.");
+
+  // 2. NOW START CALIBRATION
+  if (!mpu.setup(0x68)) {
+    Serial.println("ERROR: MPU9250 connection failed! Check Wiring.");
+  }
+
+  // Enable Madgwick Filter for better orientation stability
+  mpu.selectFilter(QuatFilterSel::MADGWICK);
+
+  // Give app a moment to connect if it was waiting
+  delay(2000);
+
+  // Tell the App we are starting Accel/Gyro calibration (Keep Still)
+  calibrationState = 1;
+  sendTelemetry();
+
+  Serial.println(
+      "Calibrating MPU... Please keep the submarine completely STILL!");
+  mpu.calibrateAccelGyro();
+  Serial.println("Accel & Gyro Calibration complete!");
+
+  // Tell the App we are starting Magnetometer calibration (Figure-8)
+  calibrationState = 2;
+  sendTelemetry();
+
+  Serial.println("Calibrating Magnetometer... PLEASE ROTATE THE SENSOR IN A "
+                 "FIGURE-8 MOTION IN THE AIR!");
+  mpu.calibrateMag();
+  Serial.println("Magnetometer Calibration complete!");
+
+  // Tell the App calibration is done
+  calibrationState = 0;
+  sendTelemetry();
+
+  systemStartTime = millis();
+  lastIntegrationTime = micros();
+
+  // Create the FreeRTOS Task and pin it to Core 0
+  xTaskCreatePinnedToCore(TaskCore0,        // Function to implement the task
+                          "TaskCore0",      // Name of the task
+                          10000,            // Stack size in words
+                          NULL,             // Task input parameter
+                          1,                // Priority of the task
+                          &TaskCore0Handle, // Task handle
+                          0);               // Core where the task should run
+}
+
+void loop() {
+  if (hardwareUpdateRequired) {
+    applyMotorLogic();
+    hardwareUpdateRequired = false;
+  }
+  if (servoUpdateRequired) {
+    frontServo.write(targetServoAngle);
+    servoUpdateRequired = false;
+  }
+  if (backServoUpdateRequired) {
+    backServo.write(targetBackServoAngle);
+    backServoUpdateRequired = false;
+  }
+
+  // Only Fast, Non-Blocking, Real-Time tasks remain in Core 1 Loop
+  handleMPU();
+
+  // --- USB / Serial Telemetry Streaming ---
+  if (millis() - previousSerialTime >= serialInterval) {
+    previousSerialTime = millis();
+    sendTelemetry();
+  }
+
+  yield(); // Required to prevent watchdog reset
+}
+
+void processSerialCommand(String cmd) {
+  if (cmd.startsWith("WIFI:")) {
+    int firstColon = cmd.indexOf(':');
+    int secondColon = cmd.indexOf(':', firstColon + 1);
+
+    if (secondColon != -1) {
+      String reqSSID = cmd.substring(firstColon + 1, secondColon);
+      String reqPass = cmd.substring(secondColon + 1);
+      connectToWiFi(reqSSID, reqPass);
+    }
+  } else if (cmd == "DIR:FWD") {
+    digitalWrite(dirPin1, HIGH);
+    digitalWrite(dirPin2, LOW);
+    isStopped = false;
+    hardwareUpdateRequired = true;
+  } else if (cmd == "DIR:REV") {
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, HIGH);
+    isStopped = false;
+    hardwareUpdateRequired = true;
+  } else if (cmd.startsWith("SPD:")) {
+    currentSpeed = cmd.substring(4).toInt();
+    hardwareUpdateRequired =
+        true; // Use flag to trigger applyMotorLogic safely on Core 1
+  } else if (cmd.startsWith("F_SRV:")) {
+    targetServoAngle = cmd.substring(6).toInt();
+    servoUpdateRequired = true;
+  } else if (cmd.startsWith("B_SRV:")) {
+    targetBackServoAngle = cmd.substring(6).toInt();
+    backServoUpdateRequired = true;
+  } else if (cmd == "STOP") {
+    // Cannot safely call emergencyStop() from Core 0 because it modifies
+    // servos/PWM directly. Instead set the target states and flags to let Core
+    // 1 handle it.
+    isStopped = true;
+    currentSpeed = 0;
+    targetServoAngle = 97;
+    targetBackServoAngle = 97;
+    digitalWrite(dirPin1, LOW);
+    digitalWrite(dirPin2, LOW);
+    hardwareUpdateRequired = true;
+    servoUpdateRequired = true;
+    backServoUpdateRequired = true;
+  } else if (cmd == "RESET_POS") {
+    posX = 0;
+    posY = 0;
+    posZ = 0;
+    velX = 0;
+    velY = 0;
+    velZ = 0;
+    Serial.println("STATUS: Position Reset");
+  } else if (cmd == "CALIBRATE") {
+    Serial.println("STATUS: Starting Hardware Calibration...");
+    calibrationState = 1;
+    sendTelemetry();
+    delay(100);
+    Serial.println(
+        "Calibrating MPU... Please keep the submarine completely STILL!");
+    mpu.calibrateAccelGyro();
+    Serial.println("Accel & Gyro Calibration complete!");
+    calibrationState = 2;
+    sendTelemetry();
+    delay(100);
+    Serial.println("Calibrating Magnetometer... PLEASE ROTATE THE SENSOR IN A "
+                   "FIGURE-8 MOTION IN THE AIR!");
+    mpu.calibrateMag();
+    Serial.println("Magnetometer Calibration complete!");
+    calibrationState = 0;
+    sendTelemetry();
+  } else if (cmd == "IP") {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("STATUS:IP:" + WiFi.localIP().toString());
+    } else {
+      Serial.println("STATUS:IP: not connected");
+    }
+  }
+}
+
+// =========================================================================
+// CORE 0 TASK (Slow, Protocol, blocking, network and peripheral tasks)
+// =========================================================================
+void TaskCore0(void *pvParameters) {
+  for (;;) {
+    // Read Temperature Sensor (Very Slow: Blocks for ~750ms!)
     handleTemperature();
+
+    // Read GPS Serial (Slow: 9600 baud processing)
     handleGPS();
-    handleMPU(); // NEW: Call IMU polling routine
 
-    if (Serial.available() > 0)
-    {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        Serial.println("ACK: " + cmd);
-
-        if (cmd == "DIR:FWD")
-        {
-            digitalWrite(dirPin1, HIGH);
-            digitalWrite(dirPin2, LOW);
-            isStopped = false;
-            hardwareUpdateRequired = true;
-        }
-        else if (cmd == "DIR:REV")
-        {
-            digitalWrite(dirPin1, LOW);
-            digitalWrite(dirPin2, HIGH);
-            isStopped = false;
-            hardwareUpdateRequired = true;
-        }
-        else if (cmd.startsWith("SPD:"))
-        {
-            currentSpeed = cmd.substring(4).toInt();
-            applyMotorLogic();
-        }
-        else if (cmd.startsWith("F_SRV:"))
-        {
-            frontServo.write(cmd.substring(6).toInt());
-        }
-        else if (cmd.startsWith("B_SRV:"))
-        {
-            backServo.write(cmd.substring(6).toInt());
-        }
-        else if (cmd == "STOP")
-        {
-            emergencyStop();
-        }
+    // Read USB Commands
+    if (Serial.available() > 0) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      processSerialCommand(cmd);
     }
 
-    // if (!isStopped && currentSpeed == 255)
-    // {
-    //     if (millis() - previousRGBTime >= rgbInterval)
-    //     {
-    //         previousRGBTime = millis();
-    //         rainbowHue += 256;
-    //         LED_RGB.setPixelColor(0, LED_RGB.ColorHSV(rainbowHue, 255, 255));
-    //         LED_RGB.show();
-    //     }
-    // }
-
-    yield();
+    // Feed the watchdog timer to prevent crashes on Core 0
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
